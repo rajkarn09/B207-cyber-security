@@ -1,0 +1,284 @@
+"""
+PhishGuard — Phishing Email Detection System
+B207 Cyber Security | Gisma University of Applied Sciences
+"""
+
+import pandas as pd
+import sqlite3
+import re
+import os
+import sys
+import joblib
+from datetime import datetime
+
+# Machine Learning Imports
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+DATASET_PATH = os.environ.get("DATASET_PATH", "phishing_dataset.xlsx")
+MODEL_PATH   = "model/classifier.pkl"
+DB_PATH      = "db/phishing_analysis.db"
+
+
+# ─────────────────────────────────────────────
+# 1. DATABASE INTEGRATION (SQLite)
+# ─────────────────────────────────────────────
+def init_db():
+    """Creates the SQLite database and required tables if they don't exist."""
+    os.makedirs("db", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scan_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject       TEXT,
+            sender        TEXT,
+            extracted_url TEXT,
+            urgency_flag  INTEGER,
+            prediction    TEXT,
+            confidence    TEXT,
+            timestamp     TEXT
+        )
+    ''')
+    conn.commit()
+    print(f"[DB] Database ready at: {DB_PATH}")
+    return conn
+
+
+# ─────────────────────────────────────────────
+# 2. MACHINE LEARNING SYSTEM
+# ─────────────────────────────────────────────
+class PhishingDetector:
+    def __init__(self):
+        self.pipeline   = None
+        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+
+    # ── Text Preprocessing ──────────────────
+    def preprocess_text(self, text):
+        """Lowercases and removes punctuation from email text."""
+        if not isinstance(text, str):
+            return ""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        return text
+
+    # ── Model Training ───────────────────────
+    def train(self, dataset_path=DATASET_PATH):
+        """
+        Trains the Logistic Regression classifier on the labeled dataset.
+        Prints accuracy, precision, recall, F1-score, and confusion matrix.
+        Saves the trained model to MODEL_PATH.
+        """
+        if not os.path.exists(dataset_path):
+            print(f"[ERROR] Dataset not found: {dataset_path}")
+            print("        Set DATASET_PATH environment variable or place file in project root.")
+            return False
+
+        print(f"[*] Loading dataset from: {dataset_path}")
+        df = pd.read_excel(dataset_path)
+        print(f"[*] Dataset: {len(df)} records | "
+              f"Phishing: {(df['label']=='phishing').sum()} | "
+              f"Legitimate: {(df['label']=='legitimate').sum()}")
+
+        # Preprocess text
+        df['email_text'] = df['email_text'].apply(self.preprocess_text)
+
+        # Features and labels
+        X = df[['email_text', 'has_link', 'urgency_flag']]
+        y = df['label'].map({'legitimate': 0, 'phishing': 1})
+
+        # Pipeline: TF-IDF for text + passthrough for numeric features
+        preprocessor = ColumnTransformer(transformers=[
+            ('text',  self.vectorizer,  'email_text'),
+            ('stats', 'passthrough',    ['has_link', 'urgency_flag'])
+        ])
+
+        self.pipeline = Pipeline([
+            ('preprocessor', preprocessor),
+            ('classifier',   LogisticRegression(max_iter=1000))
+        ])
+
+        # 80/20 train-test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        self.pipeline.fit(X_train, y_train)
+        y_pred = self.pipeline.predict(X_test)
+
+        # ── Evaluation Metrics ──────────────
+        print("\n" + "="*55)
+        print("  MODEL EVALUATION REPORT")
+        print("="*55)
+        print(f"  Accuracy : {accuracy_score(y_test, y_pred):.2%}")
+        print()
+        print(classification_report(
+            y_test, y_pred,
+            target_names=['Legitimate', 'Phishing']
+        ))
+        cm = confusion_matrix(y_test, y_pred)
+        print(f"  Confusion Matrix:")
+        print(f"                 Predicted")
+        print(f"                 Legit   Phish")
+        print(f"  Actual Legit   {cm[0][0]:>5}   {cm[0][1]:>5}")
+        print(f"  Actual Phish   {cm[1][0]:>5}   {cm[1][1]:>5}")
+        print("="*55)
+
+        # Save trained model
+        os.makedirs("model", exist_ok=True)
+        joblib.dump(self.pipeline, MODEL_PATH)
+        print(f"\n[+] Model saved to: {MODEL_PATH}")
+        return True
+
+    # ── Model Loading ────────────────────────
+    def load(self):
+        """Loads a previously saved model from disk."""
+        if not os.path.exists(MODEL_PATH):
+            return False
+        self.pipeline = joblib.load(MODEL_PATH)
+        print(f"[+] Model loaded from: {MODEL_PATH}")
+        return True
+
+    # ── Email Analysis ───────────────────────
+    def analyze(self, body_text):
+        """
+        Extracts features from raw email text and returns:
+          - prediction label ("Phishing" / "Legitimate")
+          - confidence percentage
+          - first URL found (or "None")
+          - urgency flag (1 / 0)
+        """
+        if self.pipeline is None:
+            raise RuntimeError("Model not trained or loaded yet.")
+
+        # Feature: extract first URL found
+        url_pattern   = r'(https?://\S+|www\.\S+)'
+        links_found   = re.findall(url_pattern, body_text)
+        extracted_url = links_found[0] if links_found else "None"
+        has_link      = 1 if links_found else 0
+
+        # Feature: urgency keyword detection
+        urgency_words = ['urgent', 'immediately', 'action required',
+                         'suspended', 'verify', 'password', 'click here',
+                         'confirm your', 'limited time', 'account locked']
+        urgency_flag  = 1 if any(w in body_text.lower() for w in urgency_words) else 0
+
+        # Build input for model
+        processed = self.preprocess_text(body_text)
+        input_df  = pd.DataFrame(
+            [[processed, has_link, urgency_flag]],
+            columns=['email_text', 'has_link', 'urgency_flag']
+        )
+
+        pred_num    = self.pipeline.predict(input_df)[0]
+        proba       = self.pipeline.predict_proba(input_df)[0]
+        confidence  = f"{max(proba):.1%}"
+        prediction  = "Phishing" if pred_num == 1 else "Legitimate"
+
+        return prediction, confidence, extracted_url, urgency_flag
+
+
+# ─────────────────────────────────────────────
+# 3. COMMAND LINE INTERFACE
+# ─────────────────────────────────────────────
+def main():
+    detector = PhishingDetector()
+
+    # Try to load saved model; train if not found
+    if not detector.load():
+        print("[*] No saved model found — training now...")
+        if not detector.train():
+            sys.exit(1)
+
+    db_conn = init_db()
+
+    while True:
+        print("\n" + "="*45)
+        print("   PHISHGUARD — EMAIL DETECTION SYSTEM")
+        print("="*45)
+        print("  1. Analyse New Email")
+        print("  2. View Detection History")
+        print("  3. Retrain Model")
+        print("  4. Exit")
+        print("-"*45)
+
+        choice = input("Select an option (1-4): ").strip()
+
+        # ── Option 1: Analyse Email ───────────
+        if choice == '1':
+            print("\n--- New Email Scan ---")
+            subj = input("Subject : ").strip()
+            sndr = input("Sender  : ").strip()
+            print("Email Body (press Enter when done):")
+            body = input("> ").strip()
+
+            if not body:
+                print("[!] No email body entered. Skipping.")
+                continue
+
+            prediction, confidence, url, urgency = detector.analyze(body)
+
+            print("\n" + "-"*45)
+            print("  ANALYSIS RESULT")
+            print("-"*45)
+            print(f"  Verdict     : {'⚠ ' if prediction == 'Phishing' else '✓ '}{prediction.upper()}")
+            print(f"  Confidence  : {confidence}")
+            print(f"  URL Found   : {url}")
+            print(f"  Urgency     : {'YES — suspicious keywords detected' if urgency else 'No'}")
+            print("-"*45)
+
+            # Log to database
+            cursor = db_conn.cursor()
+            cursor.execute('''
+                INSERT INTO scan_history
+                    (subject, sender, extracted_url, urgency_flag, prediction, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (subj, sndr, url, urgency, prediction, confidence,
+                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            db_conn.commit()
+            print("  [✓] Logged to database.")
+
+        # ── Option 2: View History ────────────
+        elif choice == '2':
+            print("\n" + "-"*65)
+            print("  DETECTION HISTORY REPORT")
+            print("-"*65)
+            df_hist = pd.read_sql_query("SELECT * FROM scan_history", db_conn)
+
+            if df_hist.empty:
+                print("  No records found.")
+            else:
+                pd.set_option('display.max_colwidth', 30)
+                pd.set_option('display.width', 120)
+                print(df_hist.to_string(index=False))
+
+                total = len(df_hist)
+                phish = len(df_hist[df_hist['prediction'] == 'Phishing'])
+                legit = total - phish
+                print(f"\n  SUMMARY — Total Scans: {total} | "
+                      f"Threats: {phish} | Safe: {legit} | "
+                      f"Threat Rate: {phish/total:.1%}")
+
+        # ── Option 3: Retrain ─────────────────
+        elif choice == '3':
+            path = input(f"Dataset path [{DATASET_PATH}]: ").strip() or DATASET_PATH
+            detector.train(dataset_path=path)
+
+        # ── Option 4: Exit ────────────────────
+        elif choice == '4':
+            print("\n[PhishGuard] System shutting down. Goodbye.")
+            db_conn.close()
+            break
+
+        else:
+            print("[!] Invalid option. Please enter 1, 2, 3, or 4.")
+
+
+if __name__ == "__main__":
+    main()
